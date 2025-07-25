@@ -11,5 +11,5 @@ def run_shell_script(script_path):
         sys.exit(1)
 
 if __name__ == '__main__':
-    script_path = './setup.sh'  # مسار السكربت
+    script_path = './final.sh'  # مسار السكربت
     run_shell_script(script_path)
