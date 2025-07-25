@@ -6,6 +6,16 @@ import random
 import secrets
 import string
 from pathlib import Path
+import requests
+import zipfile
+import stat
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.backends import default_backend
+import datetime
+import shutil
 
 def run_cmd(cmd, check=True, capture_output=False, text=True):
     """تشغيل أمر shell مع طباعة مخرجاته في الوقت الحقيقي"""
@@ -13,7 +23,6 @@ def run_cmd(cmd, check=True, capture_output=False, text=True):
         result = subprocess.run(cmd, shell=True, check=check, capture_output=True, text=text)
         return result.stdout.strip()
     else:
-        # طباعة stdout و stderr بشكل مباشر
         process = subprocess.Popen(cmd, shell=True)
         process.communicate()
         if check and process.returncode != 0:
@@ -22,14 +31,69 @@ def run_cmd(cmd, check=True, capture_output=False, text=True):
 def is_root():
     return os.geteuid() == 0
 
+def generate_self_signed_cert(cert_path, key_path):
+    key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=4096,
+        backend=default_backend()
+    )
+
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, u"cloudflare.com"),
+    ])
+
+    alt_names = x509.SubjectAlternativeName([
+        x509.DNSName(u"google.com"),
+        x509.DNSName(u"facebook.com"),
+    ])
+
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.utcnow())
+        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
+        .add_extension(alt_names, critical=False)
+        .sign(key, hashes.SHA256(), default_backend())
+    )
+
+    with open(key_path, "wb") as f:
+        f.write(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()
+        ))
+
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+def download_file(url, output_path):
+    print(f"Downloading {url} ...")
+    r = requests.get(url, stream=True)
+    r.raise_for_status()
+    with open(output_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            f.write(chunk)
+    print(f"Saved to {output_path}")
+
+def extract_zip(zip_path, extract_to):
+    print(f"Extracting {zip_path} ...")
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_to)
+    print(f"Extracted to {extract_to}")
+
+def make_executable(path):
+    st = os.stat(path)
+    os.chmod(path, st.st_mode | stat.S_IEXEC)
+
 def main():
-    # ---- [0] تحقق صلاحية root (غير مطلوب في Render) ----
     IS_RENDER = bool(os.environ.get("RENDER"))
     if not is_root() and not IS_RENDER:
         print("This script must be run as root on non-Render servers", file=sys.stderr)
         sys.exit(1)
 
-    # ---- [1] إعدادات أولية ----
     CONFIG_DIR = "/etc/3proxy"
     LOG_DIR = "/var/log/3proxy"
     BIN_DIR = "/usr/local/bin"
@@ -41,13 +105,12 @@ def main():
 
     Path(CONFIG_DIR).mkdir(parents=True, exist_ok=True)
     Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    Path(BIN_DIR).mkdir(parents=True, exist_ok=True)
 
-    # ---- [2] توليد بيانات عشوائية ----
     RANDOM_PORT = random.randint(30000, 60000)
     HTTP_PORT = random.randint(30000, 60000)
     HTTPS_PORT = random.randint(30000, 60000)
 
-    # توليد اسم مستخدم وكلمة مرور Proxy
     PROXY_USER = "u" + secrets.token_hex(3)
     allowed_chars = string.ascii_letters + string.digits + "!@#"
     PROXY_PASS = ''.join(secrets.choice(allowed_chars) for _ in range(20))
@@ -59,47 +122,37 @@ def main():
     print(f"Proxy user: {PROXY_USER}")
     print(f"Proxy password: {PROXY_PASS}")
 
-    # ---- [3] تثبيت التبعيات ----
-    print("Installing dependencies...")
-    if IS_RENDER:
-        run_cmd("apt-get update")
-        run_cmd("apt-get install -y build-essential openssl libssl-dev wget unzip iptables")
-    else:
-        run_cmd("apt-get update")
-        run_cmd("apt-get install -y build-essential openssl libssl-dev wget iptables-persistent unzip")
+    # ======= تحميل نسخة 3proxy جاهزة للينكس 64 بت =======
+    # يمكنك تغيير الرابط إلى نسخة أخرى إذا أردت
+    url = "https://github.com/3proxy/3proxy/releases/latest/download/3proxy-linux-x64.zip"
+    tmp_zip = "/tmp/3proxy-linux-x64.zip"
+    tmp_extract_dir = "/tmp/3proxy-linux-x64"
 
-    # ---- [4] تنزيل وتجميع 3proxy ----
-    print("Downloading and compiling 3proxy...")
-    run_cmd("wget -q https://github.com/3proxy/3proxy/archive/refs/heads/master.zip -O /tmp/3proxy.zip")
-    run_cmd("unzip -q /tmp/3proxy.zip -d /tmp")
-    os.chdir("/tmp/3proxy-master")
+    download_file(url, tmp_zip)
 
-    # تعديل Makefile لتحسين الأمان (مثل في bash)
-    run_cmd("sed -i 's/CFLAGS =/CFLAGS = -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE/' Makefile.Linux")
-    run_cmd("sed -i 's/LDFLAGS =/LDFLAGS = -Wl,-z,now -Wl,-z,relro -pie/' Makefile.Linux")
+    # إزالة مجلد فك الضغط إذا موجود
+    if os.path.exists(tmp_extract_dir):
+        shutil.rmtree(tmp_extract_dir)
 
-    # تجميع
-    run_cmd("make -f Makefile.Linux")
+    extract_zip(tmp_zip, tmp_extract_dir)
 
-    # نسخ الملف التنفيذي
-    run_cmd(f"sudo cp src/3proxy {BIN_DIR}")
+    # النسخ إلى BIN_DIR
+    src_binary = os.path.join(tmp_extract_dir, "3proxy")
+    if not os.path.isfile(src_binary):
+        print("ERROR: 3proxy binary not found in extracted files.")
+        sys.exit(1)
 
-    # ---- [5] شهادة TLS متقدمة ----
+    dst_binary = os.path.join(BIN_DIR, "3proxy")
+    shutil.copy2(src_binary, dst_binary)
+    make_executable(dst_binary)
+
+    # توليد شهادة TLS
     print("Generating stealth SSL certificate...")
     key_path = os.path.join(CONFIG_DIR, "key.pem")
     cert_path = os.path.join(CONFIG_DIR, "cert.pem")
-    Path(CONFIG_DIR).mkdir(parents=True, exist_ok=True)
+    generate_self_signed_cert(cert_path, key_path)
 
-    openssl_cmd = (
-        f"openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes "
-        f"-keyout {key_path} "
-        f"-out {cert_path} "
-        f"-subj \"/CN=cloudflare.com\" "
-        f"-addext \"subjectAltName=DNS:google.com,DNS:facebook.com\""
-    )
-    run_cmd(openssl_cmd)
-
-    # ---- [6] تكوين البروكسي ----
+    # تكوين البروكسي
     config_file_path = os.path.join(CONFIG_DIR, "3proxy.cfg")
     config_content = f"""daemon
 nolog
@@ -136,7 +189,7 @@ maxconn 100
     with open(config_file_path, "w", encoding="utf-8") as f:
         f.write(config_content)
 
-    # ---- [7] إعدادات Render الخاصة ----
+    # إعدادات Render الخاصة
     if IS_RENDER:
         print("Setting up Render-specific settings...")
         fake_response_path = os.path.join(CONFIG_DIR, "fake_response")
@@ -144,65 +197,24 @@ maxconn 100
         with open(fake_response_path, "w", encoding="utf-8") as f:
             f.write(fake_response_content)
 
-        # تشغيل socat لخدمة التمويه
         subprocess.Popen(
             ["socat", f"TCP-LISTEN:80,fork,reuseaddr", f"FILE:{fake_response_path}"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
-        # تشغيل 3proxy في الخلفية (بدون systemd)
-        # استخدم nohup و redirct الإخراج إلى ملف اللوج
         proxy_log = os.path.join(LOG_DIR, "proxy.log")
-        run_cmd(f"nohup {BIN_DIR}/3proxy {config_file_path} > {proxy_log} 2>&1 &")
-
+        run_cmd(f"nohup {dst_binary} {config_file_path} > {proxy_log} 2>&1 &")
     else:
-        # ---- [8] إعدادات الخادم العادي ----
-        print("Setting up firewall and systemd service for normal server...")
+        print("Skipping iptables and systemd setup since this is not Render environment.")
 
-        run_cmd(f"iptables -A INPUT -p tcp --dport {RANDOM_PORT} -j ACCEPT")
-        run_cmd(f"iptables -A INPUT -p tcp --dport {HTTP_PORT} -j ACCEPT")
-        run_cmd(f"iptables -A INPUT -p tcp --dport {HTTPS_PORT} -j ACCEPT")
-        run_cmd(f"iptables -A INPUT -p tcp -m multiport ! --dports {RANDOM_PORT},{HTTP_PORT},{HTTPS_PORT} -j DROP")
-        run_cmd("iptables-save > /etc/iptables/rules.v4")
-
-        systemd_service_content = f"""[Unit]
-Description=3Proxy Stealth Proxy Server
-After=network.target
-
-[Service]
-Type=simple
-ExecStart={BIN_DIR}/3proxy {config_file_path}
-Restart=always
-User=nobody
-Group=nogroup
-LimitNOFILE=65535
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-PrivateTmp=true
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-"""
-
-        systemd_service_path = "/etc/systemd/system/3proxy.service"
-        with open(systemd_service_path, "w", encoding="utf-8") as f:
-            f.write(systemd_service_content)
-
-        run_cmd("systemctl daemon-reload")
-        run_cmd("systemctl enable 3proxy")
-        run_cmd("systemctl start 3proxy")
-
-        # تعطيل ICMP
-        with open("/etc/sysctl.conf", "a", encoding="utf-8") as f:
-            f.write("\nnet.ipv4.icmp_echo_ignore_all = 1\n")
-        run_cmd("sysctl -p")
-
-    # ---- [9] عرض المعلومات ----
+    # عرض المعلومات
     print("Fetching public IP...")
-    PUBLIC_IP = run_cmd("curl -s ifconfig.me", capture_output=True)
+    try:
+        PUBLIC_IP = requests.get("https://ifconfig.me").text.strip()
+    except Exception:
+        PUBLIC_IP = "Unavailable"
 
-    # تنظيف الشاشة (اختياري)
     run_cmd("clear")
 
     print(f"\033[32m✅ البروكسي الخفي يعمل الآن!\033[0m")
@@ -217,8 +229,12 @@ WantedBy=multi-user.target
     print("2. غير المنافذ والبيانات كل أسبوع")
     print("3. على Render، استخدم منفذًا بين 10000-65535")
 
-    # ---- التنظيف ----
-    run_cmd("rm -rf /tmp/3proxy-master /tmp/3proxy.zip")
+    # تنظيف الملفات المؤقتة
+    try:
+        os.remove(tmp_zip)
+        shutil.rmtree(tmp_extract_dir)
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()
