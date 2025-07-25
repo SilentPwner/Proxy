@@ -62,8 +62,8 @@ def main():
     # ---- [3] تثبيت التبعيات ----
     print("Installing dependencies...")
     if IS_RENDER:
-        run_cmd("sudo apt-get update")
-        run_cmd("sudo apt-get install -y build-essential openssl libssl-dev wget unzip iptables")
+        run_cmd("apt-get update")
+        run_cmd("apt-get install -y build-essential openssl libssl-dev wget unzip iptables")
     else:
         run_cmd("apt-get update")
         run_cmd("apt-get install -y build-essential openssl libssl-dev wget iptables-persistent unzip")
